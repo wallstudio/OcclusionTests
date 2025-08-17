@@ -15,7 +15,7 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
 {
     GPUDrivenProcessor m_GPUDrivenProcessor;
     BatchRendererGroup m_BRG;
-    Dictionary<(Mesh mesh, Material material), (MeshRenderer[] renderers, GraphicsBuffer buffer, BatchID bid)> m_OriginalRenderers;
+    Dictionary<(Mesh mesh, Material material), (MeshRenderer[] renderers, GraphicsBuffer buffer, GraphicsBuffer idArgs, GraphicsBuffer idVis, BatchID bid)> m_OriginalRenderers;
     Dictionary<Mesh, BatchMeshID> m_Meshes;
     Dictionary<Material, BatchMaterialID> m_Materials;
 
@@ -33,13 +33,13 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
     {
         m_OriginalRenderers = GetComponentsInChildren<MeshRenderer>()
             .GroupBy(r => (r.GetComponent<MeshFilter>().sharedMesh, r.sharedMaterial))
-            .ToDictionary(g => g.Key, g => (g.ToArray(), default(GraphicsBuffer), default(BatchID)));
+            .ToDictionary(g => g.Key, g => (g.ToArray(), default(GraphicsBuffer), default(GraphicsBuffer), default(GraphicsBuffer), default(BatchID)));
 
+        // これを叩くと通常のRendererが描画されなくなる
         m_GPUDrivenProcessor.EnableGPUDrivenRenderingAndDispatchRendererData(
             renderersID: m_OriginalRenderers.SelectMany(r => r.Value.renderers).Select(r => r.GetInstanceID()).ToArray(),
             callback: GPUDrivenRendererDataCallback,
             materialUpdateOnly: false);
-
         void GPUDrivenRendererDataCallback(in GPUDrivenRendererGroupData rendererData, IList<Mesh> meshes, IList<Material> materials)
         {
         }
@@ -49,7 +49,7 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
         m_Materials = m_OriginalRenderers.Keys.Select(k => k.material).Distinct().ToDictionary(m => m, m => m_BRG.RegisterMaterial(m));
 
         var writer = new ArrayBufferWriter<byte>();
-        foreach (var (state, (renderers, _, _)) in m_OriginalRenderers.ToArray())
+        foreach (var (state, (renderers, _, _, _, _)) in m_OriginalRenderers.ToArray())
         {
             writer.Clear();
             writer.GetSpan(64).Fill(0); // 最初の64バイトは0埋めが必要
@@ -97,7 +97,20 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
                 },
                 buffer: buffer.bufferHandle);
 
-            m_OriginalRenderers[state] = (renderers, buffer, batchId);
+            var idArgs = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1, UnsafeUtility.SizeOf<GraphicsBuffer.IndirectDrawIndexedArgs>());
+            idArgs.SetData(new GraphicsBuffer.IndirectDrawIndexedArgs[]{ new()
+            {
+                indexCountPerInstance = state.mesh.GetIndexCount(0),
+                instanceCount = (uint)renderers.Length,
+                startIndex = state.mesh.GetIndexStart(0),
+                baseVertexIndex = state.mesh.GetBaseVertex(0),
+                startInstance = 0,
+            }});
+
+            var idVis = new GraphicsBuffer(GraphicsBuffer.Target.Raw, renderers.Length, UnsafeUtility.SizeOf<int>());
+            idVis.SetData(Enumerable.Range(0, renderers.Length).Select(v => 0x00ffffff & v).ToArray());
+
+            m_OriginalRenderers[state] = (renderers, buffer, idArgs, idVis, batchId);
         }
     }
 
@@ -107,24 +120,25 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
     {
         ref var cmd = ref cullingOutput.drawCommands.AsSpan()[0];
 
-        cmd.drawCommandCount = m_OriginalRenderers.Count;
-        cmd.drawCommands = Malloc<BatchDrawCommand>(cmd.drawCommandCount);
+        cmd.indirectDrawCommandCount = m_OriginalRenderers.Count;
+        cmd.indirectDrawCommands = Malloc<BatchDrawCommandIndirect>(cmd.indirectDrawCommandCount);
 
         cmd.visibleInstanceCount = m_OriginalRenderers.Sum(kv => kv.Value.renderers.Length);
         cmd.visibleInstances = Malloc<int>(cmd.visibleInstanceCount);
 
         var cmdIdxOfBatch = 0;
         var vInsIdxOfBatch = 0;
-        foreach (var ((mesh, material), (renderers, _, batchId)) in m_OriginalRenderers)
+        foreach (var ((mesh, material), (renderers, _, idArgs, idVis, batchId)) in m_OriginalRenderers)
         {
-            cmd.drawCommands[cmdIdxOfBatch] = new BatchDrawCommand
+            cmd.indirectDrawCommands[cmdIdxOfBatch] = new BatchDrawCommandIndirect
             {
+                visibleInstancesBufferHandle = idVis.bufferHandle, // visibleっていうか、DOTSインスタンスインデックスっぽい
                 visibleOffset = (uint)vInsIdxOfBatch,
-                visibleCount = (uint)renderers.Length,
+                indirectArgsBufferHandle = idArgs.bufferHandle,
+                indirectArgsBufferOffset = 0,
                 batchID = batchId,
                 meshID = m_Meshes[mesh],
                 materialID = m_Materials[material],
-                submeshIndex = 0,
                 splitVisibilityMask = 0xff,
                 flags = BatchDrawCommandFlags.None,
                 sortingPosition = 0,
@@ -141,8 +155,9 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
         cmd.drawRanges = Malloc<BatchDrawRange>(1);
         cmd.drawRanges[0] = new BatchDrawRange
         {
+            drawCommandsType = BatchDrawCommandType.Indirect,
             drawCommandsBegin = 0,
-            drawCommandsCount = (uint)cmd.drawCommandCount,
+            drawCommandsCount = (uint)cmd.indirectDrawCommandCount,
             filterSettings = new BatchFilterSettings
             {
                 renderingLayerMask = 0b00000000_00000000_00000000_00000001,
@@ -166,6 +181,25 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
     {
         m_GPUDrivenProcessor.DisableGPUDrivenRendering(
             renderersID: m_OriginalRenderers.SelectMany(r => r.Value.renderers).Select(r => r.GetInstanceID()).ToArray());
+
+        foreach (var m in m_Meshes.Values)
+        {
+            m_BRG.UnregisterMesh(m);
+        }
+        m_Meshes = null;
+        foreach (var m in m_Materials.Values)
+        {
+            m_BRG.UnregisterMaterial(m);
+        }
+        m_Materials = null;
+        foreach (var (_, (renderers, buffer, idArgs, idVis, bid)) in m_OriginalRenderers)
+        {
+            buffer?.Dispose();
+            idArgs?.Dispose();
+            idVis?.Dispose();
+            m_BRG.RemoveBatch(bid);
+        }
+        m_OriginalRenderers = null;
         m_BRG.Dispose();
         m_BRG = null;
     }
