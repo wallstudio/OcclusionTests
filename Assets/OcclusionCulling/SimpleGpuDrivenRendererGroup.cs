@@ -9,15 +9,14 @@ using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Rendering;
-using UnityEngine.XR;
 
 public class SimpleGpuDrivenRendererGroup : MonoBehaviour
 {
     GPUDrivenProcessor m_GPUDrivenProcessor;
     BatchRendererGroup m_BRG;
-    Dictionary<(Mesh mesh, Material material), (MeshRenderer[] renderers, GraphicsBuffer buffer, GraphicsBuffer idArgs, GraphicsBuffer idVis, BatchID bid)> m_OriginalRenderers;
+    Dictionary<(Mesh mesh, Shader shader), (MeshRenderer[] renderers, GraphicsBuffer buffer, GraphicsBuffer idArgs, GraphicsBuffer idVis, BatchID bid)> m_OriginalRenderers;
     Dictionary<Mesh, BatchMeshID> m_Meshes;
-    Dictionary<Material, BatchMaterialID> m_Materials;
+    Dictionary<Shader, BatchMaterialID> m_Materials;
 
     void Awake()
     {
@@ -32,7 +31,7 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
     void OnEnable()
     {
         m_OriginalRenderers = GetComponentsInChildren<MeshRenderer>()
-            .GroupBy(r => (r.GetComponent<MeshFilter>().sharedMesh, r.sharedMaterial))
+            .GroupBy(r => (r.GetComponent<MeshFilter>().sharedMesh, r.sharedMaterial.shader))
             .ToDictionary(g => g.Key, g => (g.ToArray(), default(GraphicsBuffer), default(GraphicsBuffer), default(GraphicsBuffer), default(BatchID)));
 
         // これを叩くと通常のRendererが描画されなくなる
@@ -46,7 +45,9 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
 
         m_BRG = new BatchRendererGroup(OnPerformCulling, IntPtr.Zero);
         m_Meshes = m_OriginalRenderers.Keys.Select(k => k.mesh).Distinct().ToDictionary(m => m, m => m_BRG.RegisterMesh(m));
-        m_Materials = m_OriginalRenderers.Keys.Select(k => k.material).Distinct().ToDictionary(m => m, m => m_BRG.RegisterMaterial(m));
+        m_Materials = m_OriginalRenderers.Values.SelectMany(v => v.renderers).Select(r => r.sharedMaterial)
+            .GroupBy(m => m.shader)
+            .ToDictionary(g => g.Key, g => m_BRG.RegisterMaterial(g.First()));
 
         var writer = new ArrayBufferWriter<byte>();
         foreach (var (state, (renderers, _, _, _, _)) in m_OriginalRenderers.ToArray())
@@ -78,14 +79,15 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
             for (int i = 0; i < renderers.Length; i++)
             {
                 var c = renderers[i].sharedMaterial.GetColor("_BaseColor");
-                colorSpan[i] = new float4(c.r, c.g, 7.7f, c.a);
+                colorSpan[i] = new float4(c.r, c.g, c.b, c.a);
+                colorSpan[i] *= new float4(1f, 0.8f, 0.8f, 1.0f); // 変化がわかるように
             }
             writer.Advance(UnsafeUtility.SizeOf<float4>() * renderers.Length);
 
             var bufferSize = Mathf.FloorToInt(writer.WrittenCount / 4.0f) * 4; // 4の倍数に
             var buffer = new GraphicsBuffer(GraphicsBuffer.Target.Raw, bufferSize / 4, 4); // 確保が4Byte単位なので
             buffer.SetData(writer.WrittenMemory.ToArray());
-            buffer.name = $"GPUDrivenRendererGroupBuffer_{state.mesh.name}_{state.material.name}";
+            buffer.name = $"GPUDrivenRendererGroupBuffer_{state.mesh.name}_{state.shader.name}";
 
             var overrideBit = 0b_10000000_00000000_00000000_00000000; // 0x80000000
             var batchId = m_BRG.AddBatch(
@@ -123,17 +125,13 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
         cmd.indirectDrawCommandCount = m_OriginalRenderers.Count;
         cmd.indirectDrawCommands = Malloc<BatchDrawCommandIndirect>(cmd.indirectDrawCommandCount);
 
-        cmd.visibleInstanceCount = m_OriginalRenderers.Sum(kv => kv.Value.renderers.Length);
-        cmd.visibleInstances = Malloc<int>(cmd.visibleInstanceCount);
-
         var cmdIdxOfBatch = 0;
-        var vInsIdxOfBatch = 0;
         foreach (var ((mesh, material), (renderers, _, idArgs, idVis, batchId)) in m_OriginalRenderers)
         {
             cmd.indirectDrawCommands[cmdIdxOfBatch] = new BatchDrawCommandIndirect
             {
                 visibleInstancesBufferHandle = idVis.bufferHandle, // visibleっていうか、DOTSインスタンスインデックスっぽい
-                visibleOffset = (uint)vInsIdxOfBatch,
+                visibleOffset = 0,
                 indirectArgsBufferHandle = idArgs.bufferHandle,
                 indirectArgsBufferOffset = 0,
                 batchID = batchId,
@@ -143,11 +141,6 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
                 flags = BatchDrawCommandFlags.None,
                 sortingPosition = 0,
             };
-            var s = new Span<int>(cmd.visibleInstances, 4);
-            for (int i = 0; i < renderers.Length; i++)
-                cmd.visibleInstances[vInsIdxOfBatch + i] = i;
-
-            vInsIdxOfBatch += renderers.Length;
             cmdIdxOfBatch += 1;
         }
 
@@ -173,6 +166,8 @@ public class SimpleGpuDrivenRendererGroup : MonoBehaviour
         cmd.drawCommandPickingInstanceIDs = null;
         cmd.instanceSortingPositions = null;
         cmd.instanceSortingPositionFloatCount = 0;
+
+        Debug.Log($"BRG: {cmd.indirectDrawCommandCount} batches");
 
         return new JobHandle();
     }
